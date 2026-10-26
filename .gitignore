@@ -1,0 +1,25 @@
+# Run folders, local data and machine-specific settings
+/runs/
+/cases/
+/results/
+/local/
+
+.env
+.env.*
+.DS_Store
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Raw simulation files
+*.log
+*.su2
+*.vtk
+*.vtu
+*.dat
+*.csv
+*.gz
+
+# Reviewed compact tables of the published records
+!/docs/reports/*/*.csv
