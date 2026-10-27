@@ -7,6 +7,7 @@
 | 分野 | 説明 | 記録 |
 |---|---|---|
 | 2次元Eulerインテーク | 混合圧縮型ランプインテークの形状設計・格子・SU2計算・リップ断面とアイソレータの集計を、設定JSON 1つから行うマッハ数・迎角掃引（OpenPBS またはローカル実行）。[使い方](docs/intake-euler/intake-sweep-pbs.md) | [Mach 10 設計の2段・4段ランプ、Mach 8〜12 × 迎角 −4〜+4°（2026-10-24）](docs/reports/20261024-intake-sweep-mach10/report.md) |
+| 2次元Eulerインテークの理論形状 | 多段ランプ（等強度の衝撃波をリップへ集約）の、ランプ先端からリップ先端までの水平距離÷捕獲高さ。CFDなし | [Mach 3〜14 × 温度比1.5〜5 × 1〜6段（2026-10-27）](docs/reports/20261027-intake-lip-distance/report.md) |
 
 ## 配置
 
