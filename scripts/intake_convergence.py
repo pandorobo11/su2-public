@@ -72,6 +72,8 @@ def normalized_config(path):
             'Use fixed-length checkpoints with early convergence disabled')
     for k in ('ITER','OUTPUT_WRT_FREQ','LIMITER_ITER','CONV_STARTITER','RESTART_SOL','READ_BINARY_RESTART'):
         values.pop(k, None)
+    if 'OUTPUT_FILES' in values:  # ASCII VTK and binary VTU are the same output in another file format
+        values['OUTPUT_FILES'] = values['OUTPUT_FILES'].replace('PARAVIEW_ASCII', 'PARAVIEW')
     return values
 
 

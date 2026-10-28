@@ -209,6 +209,74 @@ class EndToEndTests(unittest.TestCase):
         self.assertFalse((case/'volume'/'adopted.dat').exists())
 
 
+FAKE_ENGINE = """#!{python}
+# Stand-in for podman: inspects one image and runs the command after the image ID in the -w directory.
+import json, os, sys
+a, image, iid = sys.argv[1:], 'localhost/su2:test', 'f'*64
+if a == ['--version']:
+    print('fake-engine 1.0')
+elif a[:2] == ['image', 'inspect']:
+    if os.environ.get('FAKE_ENGINE_MISSING') or a[-1] not in (image, iid):
+        sys.exit(125)
+    print(iid if a[3] == '{{{{.Id}}}}' else json.dumps(dict(Id=iid, RepoTags=[image])))
+elif a[0] == 'run':
+    k = a.index(iid)
+    os.chdir(a[a.index('-w')+1])
+    os.environ.update(dict(z.split('=', 1) for z, e in zip(a[1:k], a[:k-1]) if e == '-e'))
+    os.execvp(a[k+1], a[k+1:])
+elif a[0] == 'rm':
+    with open(os.path.join(os.path.dirname(__file__), 'rm.log'), 'a') as f:
+        f.write(a[-1]+'\\n')
+    sys.exit(1)
+"""
+
+
+class ContainerTests(unittest.TestCase):
+    """mpirun and SU2_CFD run inside the image pinned at prepare; a missing image leaves the case unstarted."""
+
+    def test_sweep_runs_inside_the_pinned_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = Path(tmp)/'engine'
+            engine.write_text(FAKE_ENGINE.format(python=sys.executable))
+            engine.chmod(0o755)
+            container = dict(engine=str(engine), image='localhost/su2:test', options=['--shm-size=1g'])
+            cfgp = config(tmp, sweep=dict(mach=[6], aoa_deg=[-2, 0]), execution=dict(container=container))
+            env = dict(os.environ, MPLCONFIGDIR=str(Path(tmp)/'mpl'))
+            py = [sys.executable, str(HERE/'intake_sweep.py')]
+            subprocess.run(py+['prepare', str(cfgp)], check=True, env=env, capture_output=True)
+            run = (Path(tmp)/'runs'/'t-ramp2').resolve()
+            plan = json.loads((run/'plan.json').read_text())
+            self.assertEqual(plan['execution']['container']['image_id'], 'f'*64)
+            self.assertIsNone(plan['execution']['su2_cfd_sha256'])
+            dry = subprocess.run(py+['submit', str(run), '--backend', 'pbs', '--dry-run'], env=env, capture_output=True, text=True)
+            self.assertIn(f'{engine} run --rm --init', dry.stdout)
+            out = subprocess.run(py+['submit', str(run), '--only', 'm06_a+0'], env=env, capture_output=True, text=True)
+            self.assertEqual(out.returncode, 0, out.stderr[-3000:])
+            case = run/'cases'/'m06_a+0'
+            self.assertEqual(json.loads((case/'state.json').read_text())['outcome'], 'qualified')
+            rec = json.loads((case/'second'/'run.json').read_text())
+            cmd = rec['command']
+            self.assertEqual(cmd[:3], [str(engine), 'run', '--rm'])
+            self.assertEqual(cmd[cmd.index('-v')+1], f'{run}:{run}')
+            self.assertEqual(cmd[cmd.index('-w')+1], str(case/'second'))
+            self.assertEqual(cmd[cmd.index('f'*64)+1:], [sys.executable, str(HERE/'intake_sweep_fake_su2.py'), 'case.cfg'])
+            self.assertEqual(rec['container']['image_id'], 'f'*64)
+            self.assertEqual(json.loads((case/'volume.json').read_text())['status'], 'written')
+            removed = (Path(tmp)/'rm.log').read_text().split()
+            self.assertIn(rec['container']['name'], removed)
+            self.assertTrue(any('-volume-' in n for n in removed))
+            gone = subprocess.run(py+['run-case', 'm06_a-2', str(run)], env=dict(env, FAKE_ENGINE_MISSING='1'),
+                                  capture_output=True, text=True)
+            self.assertNotEqual(gone.returncode, 0)
+            self.assertIn('is not available', gone.stderr)
+            self.assertFalse((run/'cases'/'m06_a-2'/'state.json').exists())
+
+    def test_prepare_refuses_an_unknown_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                S.container_record(dict(engine=str(Path(tmp)/'no-engine'), image='su2', options=[]))
+
+
 class LegacyOutputTests(unittest.TestCase):
     def test_legacy_output_keeps_ascii_restarts_and_checkpoint_vtu(self):
         with tempfile.TemporaryDirectory() as tmp:

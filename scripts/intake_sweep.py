@@ -10,8 +10,8 @@
   compare   overlay the lip figures of several runs
 
 Every run lives in its own new directory <output_root>/<name>/ and the plan is frozen
-at prepare time (hashes of the mesh, configs, binary path and the script snapshot the
-jobs execute). The model is not in the loop: stops, retries and progression are
+at prepare time (hashes of the mesh, configs, binary path or container image ID, and the
+script snapshot the jobs execute). The model is not in the loop: stops, retries and progression are
 decided here. Fields are never deleted during a run; restarts are binary and compact by
 default, with no intermediate VTU (docs/su2-data-retention.md). See docs/intake-sweep-pbs.md.
 """
@@ -61,6 +61,9 @@ DEFAULTS = {
                      profile_stations=['C-lip', 'I01', 'MID', 'OUT']),
     'execution': dict(backend='pbs', ranks=8, su2_cfd='SU2_CFD', mpirun=['mpirun', '-np', '{ranks}'],
                       python='python3', setup=[], storage_reserve_gb=20., local_exclusive=True,
+                      # image set: mpirun and su2_cfd run inside it (paths in the image); the run directory is
+                      # mounted at its own path, and prepare pins the image ID the jobs then run
+                      container=dict(engine='podman', image=None, options=[]),
                       pbs=dict(qsub='qsub', queue=None, resources=['select=1:ncpus=8:mpiprocs=8'],
                                job_prefix='isw', extra_directives=[], analysis_queue=None,
                                analysis_resources=['select=1:ncpus=1'])),
@@ -174,6 +177,11 @@ def read_config(path):
     require(ex['backend'] in ('pbs', 'local'), 'execution.backend must be pbs or local')
     require(isinstance(ex['ranks'], int) and ex['ranks'] >= 1, 'execution.ranks must be a positive integer')
     require(isinstance(ex['mpirun'], list) and ex['mpirun'], 'execution.mpirun must be a command list')
+    c = ex['container']
+    require(c['image'] is None or (isinstance(c['image'], str) and c['image']), 'execution.container.image must be a name or null')
+    require(isinstance(c['engine'], str) and c['engine'], 'execution.container.engine must be a command name')
+    require(isinstance(c['options'], list) and all(isinstance(z, str) for z in c['options']),
+            'execution.container.options must be a list of strings')
     require(all(isinstance(v, bool) for v in cfg['output'].values()), 'output settings must be true or false')
     scale = cfg['mesh']['length_scale']
     if scale is None:
@@ -326,6 +334,7 @@ def prepare(config_path):
                 cases[cid] = dict(mach=float(M), aoa_deg=float(a), physics=phys, base_cfg_sha256=sha(d/'base.cfg'))
                 order.append(cid)
         ex = cfg['execution']
+        container = container_record(ex['container'])
         plan = dict(
             name=cfg['name'], run_dir=str(run), created_unix=time.time(), config=cfg,
             purpose='Lip-section compression performance over Mach x AoA (isolator values are diagnostics)',
@@ -342,7 +351,8 @@ def prepare(config_path):
             execution=dict(backend=ex['backend'], ranks=ex['ranks'], rank_budget=ex['ranks'], omp_threads=1,
                            su2_cfd=ex['su2_cfd'], mpirun=ex['mpirun'], python=ex['python'], setup=ex['setup'],
                            pbs=ex['pbs'], storage_reserve_gb=ex['storage_reserve_gb'], local_exclusive=ex['local_exclusive'],
-                           su2_cfd_sha256=sha(ex['su2_cfd']) if Path(ex['su2_cfd']).is_file() else None),
+                           container=container,
+                           su2_cfd_sha256=sha(ex['su2_cfd']) if not container and Path(ex['su2_cfd']).is_file() else None),
             stages=cfg['stages'], gate=cfg['gate'], analysis=cfg['analysis'], output=cfg['output'],
             ladder=['second: from first order, LIMITER_ITER=limiter_iter, CFL cfl',
                     'after failed (nonphysical/nonfinite/crash): same seed, LIMITER_ITER=delayed_limiter_iter; then CFL retry_cfl',
@@ -369,6 +379,55 @@ def prepare(config_path):
                           min_kantrowitz_margin=round(min(r.get('kantrowitz_margin', float('nan')) for r in theory), 3)),
                      indent=1))
     return run
+
+
+def container_record(c):
+    """Pin the image the jobs will run: its ID (a content hash that covers SU2_CFD and MPI), tags and engine."""
+    if not c['image']:
+        return None
+    try:
+        out = subprocess.run([c['engine'], 'image', 'inspect', '--format', '{{json .}}', c['image']],
+                             capture_output=True, text=True, timeout=120)
+    except OSError as ex:
+        raise ValueError(f'Container engine {c["engine"]!r} not found: {ex}')
+    require(out.returncode == 0, f'Image {c["image"]} not found by {c["engine"]}: {out.stderr.strip()}')
+    info = json.loads(out.stdout.strip().splitlines()[0])
+    info = info[0] if isinstance(info, list) else info
+    ver = subprocess.run([c['engine'], '--version'], capture_output=True, text=True, timeout=60).stdout.strip()
+    return dict(engine=c['engine'], engine_version=ver, image=c['image'], image_id=info['Id'],
+                repo_tags=info.get('RepoTags'), repo_digests=info.get('RepoDigests'), image_created=info.get('Created'),
+                options=c['options'])
+
+
+def solver_command(ex, ranks, cwd, run, cfg_name, tag):
+    """mpirun + SU2_CFD, inside the pinned image when the plan has one. Returns (command, container name)."""
+    inner = [z.replace('{ranks}', str(ranks)) for z in ex['mpirun']]+[ex['su2_cfd'], cfg_name]
+    c = ex.get('container')
+    if not c:
+        return inner, None
+    name = ''.join(z if z.isalnum() or z in '_.-' else '_' for z in f'su2-{tag}-{os.getpid()}')
+    env = [z for k in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS') for z in ('-e', f'{k}=1')]
+    return [c['engine'], 'run', '--rm', '--init', '--name', name, '-v', f'{run}:{run}', '-w', str(cwd), *env,
+            *c['options'], c['image_id'], *inner], name
+
+
+def remove_container(ex, name):
+    """After the engine client was killed the container may outlive it; remove it (no-op when gone)."""
+    if name:
+        try:
+            subprocess.run([ex['container']['engine'], 'rm', '-f', name], capture_output=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as ex_:
+            log(f'container {name} not removed: {ex_!r}')
+
+
+def stop_solver(proc, timeout, ex, name):
+    os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+    remove_container(ex, name)
 
 
 # ----------------------------------------------------------------------------- submit
@@ -432,6 +491,8 @@ def submit(run, backend=None, only=None, dry_run=False, resubmit=False):
         script.write_text(job_script(plan, run, c))
         if dry_run:
             print(script.read_text())
+            cmd, _ = solver_command(plan['execution'], plan['execution']['ranks'], run/'cases'/c/'first', run, 'case.cfg', 'dry')
+            print('# solver command run by the job (first stage):\n# '+' '.join(cmd)+'\n')
             continue
         out = subprocess.run([qsub, str(script)], capture_output=True, text=True, cwd=run)
         require(out.returncode == 0, f'qsub failed for {c}: {out.stderr.strip()}')
@@ -555,8 +616,9 @@ class Stage:
             cfg.update(RESTART_SOL='NO')
         write_cfg(self.dir/'case.cfg', cfg)
         ex = plan['execution']
-        cmd = [z.replace('{ranks}', str(ex['ranks'])) for z in ex['mpirun']]+[ex['su2_cfd'], 'case.cfg']
+        cmd, cname = solver_command(ex, ex['ranks'], self.dir, ctx.run, 'case.cfg', f"{plan['name']}-{ctx.cid}-{self.name}")
         rec = dict(case=ctx.cid, stage=self.name, order=self.order, status='dispatching', returncode=None, command=cmd,
+                   container=dict(name=cname, image_id=ex['container']['image_id']) if cname else None,
                    ranks=ex['ranks'], omp_threads=1, iterations=self.iterations, cfl=self.cfl, limiter_iter=self.limiter,
                    seed=str(Path(self.seed_file).relative_to(ctx.run)) if self.seed_file else None,
                    seed_sha256=sha(self.seed_file) if self.seed_file else None, seed_link=seed_link,
@@ -613,12 +675,7 @@ class Stage:
                     if reason and 'stop_signal_s' not in rec:
                         rec.update(stop_reason=reason, stop_signal_s=round(elapsed, 1))
                         dump(self.dir/'run.json', rec)
-                        os.killpg(proc.pid, signal.SIGTERM)
-                        try:
-                            proc.wait(timeout=60)
-                        except subprocess.TimeoutExpired:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                            proc.wait()
+                        stop_solver(proc, 60, ex, cname)
                         break
                     if elapsed-lastsave >= 30:
                         dump(self.dir/'run.json', rec)
@@ -628,6 +685,7 @@ class Stage:
                         proc.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         pass
+            remove_container(ex, cname)  # a container must not outlive its engine client into the next stage
             rec.update(returncode=proc.returncode, elapsed_solver_s=round(time.monotonic()-start, 1))
             text = (self.dir/'solver.log').read_text(errors='replace')
             rec['exit_success'] = 'Exit Success' in text
@@ -654,12 +712,7 @@ class Stage:
             rec['status'] = self.classify(rec, reason, gates)
         except (Exception, Cancelled) as ex_:
             if proc and proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGTERM)
-                try:
-                    proc.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    proc.wait()
+                stop_solver(proc, 30, ex, cname)
             rec.update(status='cancelled' if isinstance(ex_, Cancelled) else 'error', error=repr(ex_),
                        traceback=traceback.format_exc(), returncode=proc.returncode if proc else None,
                        elapsed_solver_s=round(time.monotonic()-start, 1))
@@ -798,6 +851,11 @@ def run_case(run, cid):
         require(sha(ctx.run/'scripts'/n) == h, f'Script snapshot {n} changed')
     if plan['execution']['backend'] == 'local' and plan['execution'].get('local_exclusive', True):
         require(not solver_processes(), 'Another SU2/MPI process is running on this machine')
+    c = plan['execution'].get('container')
+    if c:  # before state.json: a missing image leaves the case unstarted and resubmittable
+        out = subprocess.run([c['engine'], 'image', 'inspect', '--format', '{{.Id}}', c['image_id']],
+                             capture_output=True, text=True, timeout=120)
+        require(out.returncode == 0 and out.stdout.strip() == c['image_id'], f'Pinned image {c["image"]} ({c["image_id"][:12]}) is not available to {c["engine"]} on this host')
     ctx.state = dict(case=cid, mach=ctx.spec['mach'], aoa_deg=ctx.spec['aoa_deg'], status='running',
                      pbs_job_id=os.environ.get('PBS_JOBID'), host=os.uname().nodename, started_unix=time.time(),
                      attempts=[])
@@ -942,11 +1000,14 @@ def adopted_volume(ctx, checkpoint):
                    OUTPUT_WRT_FREQ='1', VOLUME_FILENAME='flow', WRT_VOLUME_OVERWRITE='YES', CONV_FILENAME='history',
                    READ_BINARY_RESTART='NO' if checkpoint.suffix == '.csv' else 'YES')
         write_cfg(out/'volume.cfg', cfg)
-        cmd = [z.replace('{ranks}', '1') for z in ex['mpirun']]+[ex['su2_cfd'], 'volume.cfg']
+        cmd, cname = solver_command(ex, 1, out, ctx.run, 'volume.cfg', f"{ctx.plan['name']}-{ctx.cid}-volume")
         start = time.monotonic()
         with (out/'solver.log').open('w') as logf:
-            rc = subprocess.run(cmd, cwd=out, stdout=logf, stderr=subprocess.STDOUT, timeout=1800,
-                                env=dict(os.environ, OMP_NUM_THREADS='1')).returncode
+            try:
+                rc = subprocess.run(cmd, cwd=out, stdout=logf, stderr=subprocess.STDOUT, timeout=1800,
+                                    env=dict(os.environ, OMP_NUM_THREADS='1')).returncode
+            finally:
+                remove_container(ex, cname)
         vtu = out/'flow.vtu'
         h = History(out/'history.csv').read()
         rec.update(command=cmd, returncode=rc, elapsed_s=round(time.monotonic()-start, 1), iterations_run=len(h['Inner_Iter']) if h else 0)

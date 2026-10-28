@@ -7,10 +7,12 @@ All lengths are metres, pressure Pa and temperature K. Results are per metre spa
 import argparse
 from collections import Counter
 import csv
+import gzip
 import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import time
@@ -688,7 +690,7 @@ def configuration(case, s, iterations, second_order, cfl, numerics=None):
                       MUSCL_TURB="NO", TIME_DISCRE_TURB="EULER_IMPLICIT", CFL_REDUCTION_TURB=0.5,
                       CONV_FIELD="( RMS_DENSITY, RMS_ENERGY, RMS_NU_TILDE )",
                       SCREEN_OUTPUT="( INNER_ITER, RMS_DENSITY, RMS_ENERGY, RMS_NU_TILDE, NONPHYSICAL_POINTS )",
-                      OUTPUT_FILES="( RESTART, RESTART_ASCII, PARAVIEW_ASCII, SURFACE_CSV )",
+                      OUTPUT_FILES="( RESTART, RESTART_ASCII, PARAVIEW, SURFACE_CSV )",
                       VOLUME_OUTPUT="( COORDINATES, SOLUTION, PRIMITIVE, WALL_Y_PLUS, SKIN_FRICTION, HEAT_FLUX, RESIDUAL, LIMITER )")
     if 'flow_limiter' in numerics:
         values['SLOPE_LIMITER_FLOW']=numerics['flow_limiter']
@@ -913,9 +915,28 @@ def primitives(data, s):
                 total_enthalpy=s["gamma"]*s["gas_constant"]/(s["gamma"]-1)*total_temperature)
 
 
-def read_wall_yplus(path, points):
-    """Read SU2 PARAVIEW_ASCII (legacy VTK); restart CSV has solution fields only."""
-    with path.open() as stream:
+def volume_output(stage, stem="flow"):
+    """The stage's volume file: binary VTU, else legacy ASCII VTK, plain or gzipped by history_archive.py."""
+    for name in (stem+".vtu", stem+".vtk", stem+".vtk.gz"):
+        if (Path(stage)/name).is_file():
+            return Path(stage)/name
+    raise ValueError(f"No {stem}.vtu or {stem}.vtk in {stage}")
+
+
+def content_sha256(path):
+    """SHA-256 of the file content; a .gz file hashes as the file it restores, so provenance is unchanged."""
+    path = Path(path)
+    h = hashlib.sha256()
+    with (gzip.open(path, "rb") if path.suffix == ".gz" else path.open("rb")) as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _legacy_vtk(path, wanted):
+    """Points and selected point arrays of SU2 PARAVIEW_ASCII output (.vtk or .vtk.gz)."""
+    out, xyz = {}, None
+    with (gzip.open(path, "rt") if path.suffix == ".gz" else path.open()) as stream:
         require(stream.readline().startswith("# vtk DataFile"), "Expected VTK header")
         stream.readline()
         require(stream.readline().strip() == "ASCII", "Expected ASCII VTK")
@@ -927,22 +948,78 @@ def read_wall_yplus(path, points):
                 values.extend(float(v) for v in line.split())
             require(len(values) == count, "VTK array length mismatch")
             return np.array(values)
-        found_points, point_data, values = False, False, None
+        count, point_data = None, False
         for line in stream:
-            fields = line.split()
-            if fields[:1] == ["POINTS"]:
-                require(int(fields[1]) == len(points), "VTK point count mismatch")
-                xyz = numbers(3*len(points)).reshape(-1, 3)
-                require(np.allclose(xyz[:, :2], points, rtol=1e-6, atol=1e-9), "VTK mesh mismatch")
-                found_points = True
-            elif fields[:1] == ["POINT_DATA"]:
-                require(int(fields[1]) == len(points), "VTK point-data count mismatch")
+            words = line.split()
+            if words[:1] == ["POINTS"]:
+                count = int(words[1])
+                xyz = numbers(3*count).reshape(-1, 3)
+            elif words[:1] == ["POINT_DATA"]:
+                require(count is not None and int(words[1]) == count, "VTK point-data count mismatch")
                 point_data = True
-            elif fields[:2] == ["SCALARS", "Y_Plus"]:
-                require(point_data and stream.readline().strip() == "LOOKUP_TABLE default", "Invalid Y_Plus header")
-                values = numbers(len(points))
-                break
-    require(found_points and values is not None, "Missing RANS wall Y_Plus output")
+            elif words[:1] in (["SCALARS"], ["VECTORS"]) and words[1] in wanted:
+                require(point_data, "Expected VTK point data")
+                if words[0] == "SCALARS":
+                    require(len(words) == 4 and words[3] == "1" and
+                            stream.readline().strip() == "LOOKUP_TABLE default", f"Invalid {words[1]} header")
+                    out[words[1]] = numbers(count)
+                else:
+                    out[words[1]] = numbers(3*count).reshape(-1, 3)
+                if set(out) == set(wanted):
+                    break
+    return xyz, out
+
+
+VTU_TYPES = {"Float32": "<f4", "Float64": "<f8", "Int32": "<i4", "Int64": "<i8", "UInt8": "u1"}
+
+
+def _binary_vtu(path, wanted):
+    """Points and selected point arrays of SU2 PARAVIEW output (VTU with raw appended data)."""
+    raw = path.read_bytes()
+    start = raw.find(b'<AppendedData encoding="raw">')
+    require(start > 0, "Expected a VTU with raw appended data")
+    head = raw[:start].decode()
+    require('byte_order="LittleEndian"' in head, "Expected a little-endian VTU")
+    size_type = "<u8" if 'header_type="UInt64"' in head else "<u4"
+    data = raw[raw.index(b"_", start)+1:]
+    count = int(re.search(r'NumberOfPoints="(\d+)"', head)[1])
+
+    def array(tag):
+        kind, comps, offset = tag.group(1), int(tag.group(3)), int(tag.group(4))
+        width = np.dtype(size_type).itemsize
+        nbytes = int(np.frombuffer(data, size_type, 1, offset)[0])
+        values = np.frombuffer(data, VTU_TYPES[kind], nbytes//np.dtype(VTU_TYPES[kind]).itemsize, offset+width)
+        require(len(values) == count*comps, f"VTU array length mismatch: {tag.group(2) or 'Points'}")
+        return values.astype(float).reshape(-1, comps) if comps > 1 else values.astype(float)
+    tags = r'<DataArray type="(\w+)" Name="(\w*)" NumberOfComponents=\s*"(\d+)" offset="(\d+)"'
+    points = re.search(r"<Points>\s*"+tags, head)
+    require(points is not None, "VTU has no points")
+    xyz = array(points)
+    out = {}
+    section = head[head.index("<PointData>"):head.index("</PointData>")] if "<PointData>" in head else ""
+    for tag in re.finditer(tags, section):
+        if tag.group(2) in wanted:
+            out[tag.group(2)] = array(tag)
+    return xyz, out
+
+
+def read_volume(path, points, wanted, *, rtol=1e-6, atol=1e-9, finite=True):
+    """Selected point arrays of an SU2 volume file (.vtu, .vtk or .vtk.gz), checked against the mesh points."""
+    path = Path(path)
+    if not path.exists() and Path(str(path)+".gz").is_file():
+        path = Path(str(path)+".gz")
+    wanted = set(wanted)
+    xyz, out = (_binary_vtu if path.suffix == ".vtu" else _legacy_vtk)(path, wanted)
+    require(xyz is not None and len(xyz) == len(points), "Volume point count differs from mesh")
+    require(np.allclose(xyz[:, :2], points, rtol=rtol, atol=atol), "Volume mesh mismatch: coordinates differ")
+    require(set(out) == wanted, f"Missing volume arrays: {sorted(wanted-set(out))}")
+    require(not finite or all(np.isfinite(v).all() for v in out.values()), "Invalid volume values: nonfinite")
+    return out
+
+
+def read_wall_yplus(path, points):
+    """Wall y+ from the volume output (VTU or legacy VTK); restart CSV has solution fields only."""
+    values = read_volume(path, points, {"Y_Plus"}, finite=False)["Y_Plus"]
     require(len(values) == len(points) and np.isfinite(values).all() and np.all(values >= 0), "Invalid wall y+")
     return values
 
@@ -1032,7 +1109,7 @@ def analyze(case, result):
         checks["outlet_forward_flow"] = all(boundary[n]["massflow_outward"] > 0 and
             boundary[n]["reverse_massflow_fraction"] < 1e-6 for n in outlets)
         wall_diagnostics = {}
-        all_yplus = read_wall_yplus(stage/"flow.vtk", points)
+        all_yplus = read_wall_yplus(volume_output(stage), points)
         for name in ("lower", "cowl"):
             if name not in markers:
                 continue

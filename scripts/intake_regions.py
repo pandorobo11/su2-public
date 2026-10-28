@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from intake_adapt import solution, digest, sensors
-from intake_euler import read_csv, require, polygon
+from intake_euler import content_sha256, read_csv, read_volume, require, polygon, volume_output
 from generate_airfoil_mesh import cell_blocks
 
 RESIDUALS = {'Residual_Density':'rms[Rho]', 'Residual_Energy':'rms[RhoE]', 'Residual_Nu_Tilde':'rms[nu]'}
@@ -31,43 +31,8 @@ def wall_residual_fields(fields):
 
 
 def vtk_fields(path, points, wanted):
-    """Read selected point arrays from SU2 legacy ASCII output with mesh checks."""
-    output = {}
-    with path.open() as f:
-        require(f.readline().startswith('# vtk DataFile'), 'Expected VTK')
-        f.readline()
-        require(f.readline().strip() == 'ASCII', 'Expected ASCII VTK')
-        count = None
-        data = False
-        matched = False
-        def numbers(n):
-            values=[]
-            while len(values)<n:
-                line=f.readline()
-                require(bool(line), 'Truncated VTK')
-                values.extend(map(float,line.split()))
-            require(len(values)==n and np.isfinite(values).all(), 'Invalid VTK values')
-            return np.array(values)
-        for line in f:
-            words=line.split()
-            if not words:
-                continue
-            if words[0]=='POINTS':
-                count=int(words[1]);require(count==len(points), 'VTK point count differs')
-                coords=numbers(3*count).reshape(-1,3)
-                require(np.allclose(coords[:,:2],points,atol=1e-6,rtol=0), 'VTK coordinates differ')
-                matched=True
-            elif words[0]=='POINT_DATA':
-                require(int(words[1])==len(points), 'VTK point data differs');data=True
-            elif words[0] in ('SCALARS','VECTORS') and words[1] in wanted:
-                require(matched and data, 'Expected VTK point data')
-                width=3 if words[0]=='VECTORS' else 1
-                if width==1:
-                    require(len(words)==4 and words[3]=='1' and f.readline().strip()=='LOOKUP_TABLE default', 'Invalid scalar')
-                values=numbers(count*width)
-                output[words[1]]=values.reshape(-1,3) if width==3 else values
-    require(set(output)==set(wanted), 'Missing requested VTK arrays')
-    return output
+    """Read selected point arrays from SU2 volume output (VTU, or legacy ASCII VTK, plain or gzipped)."""
+    return read_volume(path, points, wanted, rtol=0, atol=1e-6)
 
 
 def shear_indicator(points, cells, flow):
@@ -330,13 +295,13 @@ def audit_plan(case, result, plan_path):
     require(s.get('mode')=='rans','Requires RANS')
     require(plan['mesh_sha256']==record['mesh_sha256'] and
             plan['physics_sha256']==record['physics_sha256'],'Coverage plan mesh or physics differs')
-    fields=vtk_fields(result/'second/flow.vtk',p,{'Skin_Friction_Coefficient'})
+    fields=vtk_fields(volume_output(result/'second'),p,{'Skin_Friction_Coefficient'})
     reverse=wall_reversal(p,c,m,flow,fields['Skin_Friction_Coefficient'])
     coverage=wall_coverage(p,m,plan['wall_edges'],reverse)
     return dict(**coverage,provisional=True,plan_sha256=digest(plan_path),result=str(result),
         source={**{k:record[k] for k in ('mesh_sha256','physics_sha256','config_sha256','binary_sha256')},
                 'restart_sha256':digest(result/'second/restart_flow.csv'),
-                'vtk_sha256':digest(result/'second/flow.vtk')},
+                'vtk_sha256':content_sha256(volume_output(result/'second'))},
         note='Coverage of observed joint-sign reversals only. The plan is unchanged. Tiny negative values are retained; coverage does not certify physical separation, mesh adequacy or convergence.')
 
 
@@ -351,7 +316,7 @@ def diagnose(case, results, fraction=.01, minimum_hits=2, shear_threshold=.03, r
     for result in results:
         s,p,c,m,data,flow,record=solution(case,result)
         require(s.get('mode')=='rans' and 'mesh_policy' in s, 'Requires RANS with geometry mesh policy')
-        fields=vtk_fields(result/'second/flow.vtk',p,set(RESIDUALS)|{'Skin_Friction_Coefficient'})
+        fields=vtk_fields(volume_output(result/'second'),p,set(RESIDUALS)|{'Skin_Friction_Coefficient'})
         history=read_csv(result/'second/history.csv')
         shear=shear_indicator(p,c,flow);shock=sensors(p,c,flow)
         if votes is None:
@@ -376,7 +341,7 @@ def diagnose(case, results, fraction=.01, minimum_hits=2, shear_threshold=.03, r
             state_extrema=extrema_residual_diagnostics(p,flow,fields,areas,fraction),
             wall_reversal=wall_reversal(p,c,m,flow,fields['Skin_Friction_Coefficient']),
             source={**{k:record[k] for k in ('mesh_sha256','physics_sha256','config_sha256','binary_sha256')},
-                    'restart_sha256':digest(result/'second/restart_flow.csv'), 'vtk_sha256':digest(result/'second/flow.vtk')}))
+                    'restart_sha256':digest(result/'second/restart_flow.csv'), 'vtk_sha256':content_sha256(volume_output(result/'second'))}))
     persistent=np.logical_or.reduce([v>=minimum_hits for v in votes.values()])
     near_persistent=np.any(persistent[c[3]],axis=1)
     shear_any=shear_votes[3]>0

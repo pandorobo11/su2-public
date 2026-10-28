@@ -7,7 +7,7 @@
 ## 使い方
 
 ```sh
-# 1. 設定を用意する（例をコピーし、SU2_CFD のパスなどを書き換える）
+# 1. 設定を用意する（例をコピーし、podman のイメージ名などを書き換える）
 cp scripts/examples/intake-sweep-ramp4.json my-ramp4.json
 # 2. 形状・格子・各ケースの設定を作る（CFDは動かさない）
 python3 scripts/intake_sweep.py prepare my-ramp4.json
@@ -23,7 +23,7 @@ python3 scripts/intake_sweep.py compare runs/ramp2-m10-tr2.5-cr1.3 runs/ramp4-m1
 - **スクリプトの写し**：`prepare` は使うスクリプトを実行フォルダの `scripts/` に写し、ハッシュを `plan.json` に記録する。ジョブはこの写しを実行する。計算中にリポジトリを更新しても、実行中の掃引は変わらない。
 - `submit --dry-run` は、qsub せずにジョブスクリプトを表示する。最初に一度確認する。
 - `prepare` の後、`analysis/figures/boundary-conditions.png` と `mesh.png` で境界と格子を確認してから投入する。
-- 必要な環境：Python 3.9 以上と numpy・matplotlib、SU2 8.5.0、mpirun。インターネット接続は不要。
+- 必要な環境：Python 3.9 以上と numpy・matplotlib（ホスト側）、SU2 8.5.0 と mpirun（podman イメージの中、または `container.image` を `null` にしてホスト側）。インターネット接続は不要。
 
 ## 設定ファイル
 
@@ -38,8 +38,31 @@ python3 scripts/intake_sweep.py compare runs/ramp2-m10-tr2.5-cr1.3 runs/ramp4-m1
 | `mesh.length_scale` | 省略時は捕獲高さ÷0.35 m。前回の fine-quad 格子と同じ相対解像度になる |
 | `stages`、`gate` | 反復数・CFL・limiter・受入判定。省略時は前回と同じ値（下表） |
 | `output` | 出力の形式。既定は `restart_ascii=false`（restart は DAT だけ）、`restart_compact=true`（座標と保存量だけ）、`checkpoint_volume=false`（チェックポイントごとの VTU なし）、`adopted_volume=true`（解析後に採用点の VTU を 1 個作る）。2026年10月26日より前の形式は 4 つを反転した値。データ容量を抑えるための設定 |
-| `execution` | `ranks`（MPI数）、`su2_cfd`、`mpirun`（`{ranks}` が置き換わる）、`python`、`setup`（ジョブ内で先に実行する行。例：`module load ...`）、`pbs` |
+| `execution` | `ranks`（MPI数）、`su2_cfd`、`mpirun`（`{ranks}` が置き換わる）、`python`、`setup`（ジョブ内で先に実行する行。例：`module load ...`）、`container`、`pbs` |
+| `execution.container` | `engine`（既定 `podman`）、`image`（イメージ名。`null` ならホストの `su2_cfd` を直接実行）、`options`（`podman run` に足す引数）。次節を参照 |
 | `execution.pbs` | `queue`、`resources`（`#PBS -l` の行）、`job_prefix`、`extra_directives`、集計ジョブ用の `analysis_queue`・`analysis_resources` |
+
+## podman イメージの SU2 を使う
+
+ワークステーションでは、podman で作ったイメージの中の SU2 を使う。`execution.container.image` を設定すると、各段の計算と採用点の VTU 作成を次のコマンドで実行する（`submit --dry-run` で実際のコマンドを表示する）。
+
+```sh
+podman run --rm --init --name su2-<name>-<case>-<stage>-<pid> -v <実行フォルダ>:<実行フォルダ> -w <段のフォルダ> \
+  -e OMP_NUM_THREADS=1 ... <options> <イメージID> mpirun -np 8 SU2_CFD case.cfg
+```
+
+- **MPI はイメージの中で動かす**。`mpirun` と `su2_cfd` はイメージの中のコマンド名またはパスで書く（例の設定は `mpirun`、`SU2_CFD`）。1ジョブ1ノード（`select=1`）の前提で、ホストの mpirun からランクごとにコンテナを起動する方式には対応していない。Python の解析はホスト側で動く。
+- **実行フォルダは同じパスでマウントする**。格子へのシンボリックリンクと初期解のハードリンクがそのまま使える。実行フォルダの外のファイルは使わない。
+- **イメージは ID で固定する**。`prepare` がイメージ名を `podman image inspect` で調べ、ID・タグ・ダイジェスト・podman のバージョンを `plan.json` の `execution.container` に記録する。ジョブはタグではなくこの ID を実行するので、掃引中にイメージを作り直しても計算中の掃引は変わらない。`prepare` の時点でイメージが無ければ止まる。`run-case` は始める前に ID がそのホストにあるか確かめ、無ければ `state.json` を作らずに終わる（未開始のままなので、イメージを戻してから再投入できる）。各段の `run.json` にコマンド、コンテナ名、イメージ ID を残す。
+- **停止**：qdel などで SIGTERM が届くと、podman を通して SU2 を止め、`podman rm -f <コンテナ名>` でコンテナを消してから `cancelled` と記録する。各段の終わりにも同じコマンドを実行し、前の段のコンテナが残ったまま次の段を始めない。
+- `options` の例：`--shm-size=2g`（podman の既定 64 MB の `/dev/shm` では MPI の共有メモリ通信が足りないことがある）、`--security-opt=label=disable`（SELinux が有効なホストでマウントしたフォルダへ書けるようにする。無効なホストでは影響しない）。
+
+ワークステーションで最初に確かめること：
+
+1. `podman run --rm <イメージ> SU2_CFD` で、SU2 8.5.0 の表示が出る（設定ファイルが無いというエラーで終わってよい）。
+2. イメージの中の利用者が root で MPI が Open MPI なら、`mpirun` に `--allow-run-as-root` を足す（または `options` に `-e OMPI_ALLOW_RUN_AS_ROOT=1 -e OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1`）。rootless podman ではコンテナの root はホストの利用者に対応するので、出力ファイルの所有者はホストの利用者になる。
+3. PBS のジョブの中から podman が動く。rootless podman は `XDG_RUNTIME_DIR` が無いと警告や失敗になることがあるので、必要なら `setup` に `export XDG_RUNTIME_DIR=...` を書く。
+4. 1ケースだけ投入し（`submit --only <case>`）、計算中に `podman ps` と `top` で8プロセスが動いていること、`qdel` でコンテナが消えることを確かめてから全体を投入する。podman の cgroup の設定によっては、コンテナが PBS ジョブの cgroup の外で動き、PBS の CPU 割り当てや強制終了が効かないことがある。その場合は `options` に `--cgroups=disabled` などを足して確かめる。
 
 今回の形状：設計 Mach 10、ランプ後静温比2.5、捕獲高さ1 m、鋭角カウル、収縮比1.3。掃引は Mach 8〜12（設計±2）×迎角 −4〜+4°（2°刻み）の25条件。
 

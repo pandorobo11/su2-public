@@ -1,5 +1,5 @@
 {
-  "_comment": "Workstation (OpenPBS) sweep. Set execution.su2_cfd (and setup lines if modules are needed) before 'prepare'. See docs/intake-euler/intake-sweep-pbs.md.",
+  "_comment": "Workstation (OpenPBS) sweep with SU2 from a podman image. Set execution.container.image (and su2_cfd/mpirun as paths inside the image) before 'prepare'; image null runs su2_cfd on the host. See docs/intake-euler/intake-sweep-pbs.md.",
   "name": "ramp4-m10-tr2.5-cr1.3",
   "output_root": "runs",
   "design": {
@@ -20,10 +20,15 @@
   "execution": {
     "backend": "pbs",
     "ranks": 8,
-    "su2_cfd": "/path/to/su2-8.5.0/bin/SU2_CFD",
+    "su2_cfd": "SU2_CFD",
     "mpirun": ["mpirun", "-np", "{ranks}"],
     "python": "python3",
     "setup": [],
+    "container": {
+      "engine": "podman",
+      "image": "localhost/su2:8.5.0",
+      "options": ["--shm-size=2g", "--security-opt=label=disable"]
+    },
     "pbs": {
       "queue": "calc_8p",
       "resources": ["select=1:ncpus=8:mpiprocs=8"],
